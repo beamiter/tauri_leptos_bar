@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
+use web_sys::{MouseEvent, WheelEvent};
 
 #[wasm_bindgen]
 extern "C" {
@@ -45,12 +46,48 @@ struct SystemSnapshot {
     is_charging: bool,
 }
 
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+struct AudioSnapshot {
+    volume: i32,
+    is_muted: bool,
+    device_name: String,
+    has_device: bool,
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+struct BrightnessSnapshot {
+    percent: Option<u8>,
+}
+
 #[derive(Deserialize)]
 struct EventPayload<T> {
     payload: T,
 }
 
-const BUTTONS: [&str; 9] = ["🐖", "🐄", "🐂", "🐃", "🦥", "🦣", "🐏", "🦆", "🐢"];
+const TAG_ICONS: [&str; 9] = [
+    "\u{F0A1E}",
+    "\u{F0239}",
+    "\u{F0A1B}",
+    "\u{F0B79}",
+    "\u{F024B}",
+    "\u{F0388}",
+    "\u{F0567}",
+    "\u{F01F0}",
+    "\u{F0297}",
+];
+
+const ICON_CPU: &str = "\u{F4BC}";
+const ICON_MEM: &str = "\u{F035B}";
+const ICON_BAT_FULL: &str = "\u{F0079}";
+const ICON_BAT_CHG: &str = "\u{F0084}";
+const ICON_VOL_HIGH: &str = "\u{F057E}";
+const ICON_VOL_MID: &str = "\u{F0580}";
+const ICON_VOL_LOW: &str = "\u{F057F}";
+const ICON_VOL_MUTE: &str = "\u{F075F}";
+const ICON_BRIGHT: &str = "\u{F00DE}";
+const ICON_SHOT: &str = "\u{F0104}";
+const ICON_TIME: &str = "\u{F0954}";
+const ICON_MON: &str = "\u{F0379}";
 
 fn button_class(t: &TagStatus) -> &'static str {
     if t.is_filled {
@@ -104,9 +141,9 @@ fn parse_lt_symbol(lts: &str) -> (String, Option<f32>) {
 
 fn monitor_icon(n: i32) -> String {
     if n == 0 {
-        "󰎡".to_string()
+        "\u{F02DA}".to_string()
     } else if n == 1 {
-        "󰎤".to_string()
+        "\u{F02DB}".to_string()
     } else {
         format!("M{}", n)
     }
@@ -121,6 +158,23 @@ fn sev(p: f32) -> &'static str {
         "usage-caution"
     } else {
         "usage-danger"
+    }
+}
+
+fn volume_icon(a: Option<&AudioSnapshot>) -> &'static str {
+    match a {
+        None => ICON_VOL_MUTE,
+        Some(s) => {
+            if !s.has_device || s.is_muted || s.volume <= 0 {
+                ICON_VOL_MUTE
+            } else if s.volume < 34 {
+                ICON_VOL_LOW
+            } else if s.volume < 67 {
+                ICON_VOL_MID
+            } else {
+                ICON_VOL_HIGH
+            }
+        }
     }
 }
 
@@ -150,10 +204,17 @@ struct LayoutCmdArgs {
     monitor_id: i32,
 }
 
+#[derive(Serialize)]
+struct DeltaArgs {
+    delta: i32,
+}
+
 #[component]
 fn App() -> impl IntoView {
     let (monitor, set_monitor) = signal(None::<MonitorInfoSnapshot>);
     let (system, set_system) = signal(None::<SystemSnapshot>);
+    let (audio, set_audio) = signal(None::<AudioSnapshot>);
+    let (brightness, set_brightness) = signal(None::<BrightnessSnapshot>);
     let (pressed, set_pressed) = signal(None::<usize>);
     let (layout_open, set_layout_open) = signal(false);
     let (show_seconds, set_show_seconds) = signal(true);
@@ -184,6 +245,36 @@ fn App() -> impl IntoView {
         });
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = tauri_listen("system-update", &cb).await {
+                error!(format!("listen failed: {:?}", e));
+            }
+            cb.forget();
+        });
+    });
+
+    // listen audio-update
+    Effect::new(move |_| {
+        let cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
+            if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<AudioSnapshot>>(evt) {
+                set_audio.set(Some(p.payload));
+            }
+        });
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = tauri_listen("audio-update", &cb).await {
+                error!(format!("listen failed: {:?}", e));
+            }
+            cb.forget();
+        });
+    });
+
+    // listen brightness-update
+    Effect::new(move |_| {
+        let cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
+            if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<BrightnessSnapshot>>(evt) {
+                set_brightness.set(Some(p.payload));
+            }
+        });
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = tauri_listen("brightness-update", &cb).await {
                 error!(format!("listen failed: {:?}", e));
             }
             cb.forget();
@@ -242,7 +333,7 @@ fn App() -> impl IntoView {
                     <div class="button-row">
                         <div class="buttons-container">
                             {
-                                BUTTONS.iter().enumerate().map(|(i, emoji)| {
+                                TAG_ICONS.iter().enumerate().map(|(i, icon)| {
                                     let tag = tags.get(i).cloned().unwrap_or_default();
                                     let base = button_class(&tag);
                                     let cls = move || {
@@ -266,8 +357,9 @@ fn App() -> impl IntoView {
                                                 invoke_async("send_tag_command", args);
                                             }
                                             on:mouseleave=move |_| set_pressed.set(None)
+                                            title=format!("Tag {}", i + 1)
                                         >
-                                            {*emoji}
+                                            <span class="nf-icon">{*icon}</span>
                                         </button>
                                     }
                                 }).collect_view()
@@ -336,7 +428,7 @@ fn App() -> impl IntoView {
                                             if s.battery_percent > 50.0 { "usage-good" }
                                             else if s.battery_percent > 20.0 { "usage-warn" }
                                             else { "usage-danger" });
-                                        let batt_icon = if s.is_charging { "🔌" } else { "🔋" };
+                                        let batt_icon = if s.is_charging { ICON_BAT_CHG } else { ICON_BAT_FULL };
                                         let mem_title = format!("内存使用: {} / {}", format_bytes(s.memory_used), format_bytes(s.memory_total));
                                         let batt_title = if s.is_charging {
                                             format!("电池充电中: {:.1}%", s.battery_percent)
@@ -346,24 +438,88 @@ fn App() -> impl IntoView {
                                         view! {
                                             <>
                                                 <div class=cpu_cls title="CPU 平均使用率">
-                                                    {format!("CPU {:.0}%", s.cpu_average)}
+                                                    <span class="nf-icon">{ICON_CPU}</span>
+                                                    {format!(" {:.0}%", s.cpu_average)}
                                                 </div>
                                                 <div class=mem_cls title=mem_title>
-                                                    {format!("MEM {:.0}%", s.memory_usage_percent)}
+                                                    <span class="nf-icon">{ICON_MEM}</span>
+                                                    {format!(" {:.0}%", s.memory_usage_percent)}
                                                 </div>
                                                 <div class=batt_cls title=batt_title>
-                                                    {format!("{} {:.0}%", batt_icon, s.battery_percent)}
+                                                    <span class="nf-icon">{batt_icon}</span>
+                                                    {format!(" {:.0}%", s.battery_percent)}
                                                 </div>
                                             </>
                                         }.into_any()
                                     }
                                     None => view! {
                                         <>
-                                            <div class="pill usage-pill usage-warn">"CPU --%"</div>
-                                            <div class="pill usage-pill usage-warn">"MEM --%"</div>
-                                            <div class="pill usage-pill usage-warn">"🔋 --%"</div>
+                                            <div class="pill usage-pill usage-warn">
+                                                <span class="nf-icon">{ICON_CPU}</span>" --%"
+                                            </div>
+                                            <div class="pill usage-pill usage-warn">
+                                                <span class="nf-icon">{ICON_MEM}</span>" --%"
+                                            </div>
+                                            <div class="pill usage-pill usage-warn">
+                                                <span class="nf-icon">{ICON_BAT_FULL}</span>" --%"
+                                            </div>
                                         </>
                                     }.into_any()
+                                }}
+                            </div>
+
+                            <div
+                                class="pill brightness-pill"
+                                on:click=move |_| {
+                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta: 5 }).unwrap_or(JsValue::NULL);
+                                    invoke_async("adjust_brightness", args);
+                                }
+                                on:wheel=move |e: WheelEvent| {
+                                    e.prevent_default();
+                                    let delta = if e.delta_y() < 0.0 { 5 } else { -5 };
+                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta }).unwrap_or(JsValue::NULL);
+                                    invoke_async("adjust_brightness", args);
+                                }
+                                on:contextmenu=move |e: MouseEvent| {
+                                    e.prevent_default();
+                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta: -5 }).unwrap_or(JsValue::NULL);
+                                    invoke_async("adjust_brightness", args);
+                                }
+                                title="左键加亮 / 右键减暗 / 滚轮调节"
+                            >
+                                <span class="nf-icon">{ICON_BRIGHT}</span>
+                                {move || match brightness.get().and_then(|b| b.percent) {
+                                    Some(p) => format!(" {}%", p),
+                                    None => " --".to_string(),
+                                }}
+                            </div>
+
+                            <div
+                                class=move || {
+                                    let muted = match audio.get() {
+                                        None => true,
+                                        Some(s) => s.is_muted || !s.has_device,
+                                    };
+                                    if muted { "pill volume-pill muted" } else { "pill volume-pill" }
+                                }
+                                on:click=move |_| invoke_async("toggle_mute", JsValue::NULL)
+                                on:wheel=move |e: WheelEvent| {
+                                    e.prevent_default();
+                                    let delta = if e.delta_y() < 0.0 { 5 } else { -5 };
+                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta }).unwrap_or(JsValue::NULL);
+                                    invoke_async("adjust_volume", args);
+                                }
+                                on:contextmenu=move |e: MouseEvent| {
+                                    e.prevent_default();
+                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta: -5 }).unwrap_or(JsValue::NULL);
+                                    invoke_async("adjust_volume", args);
+                                }
+                                title="左键静音 / 滚轮调节"
+                            >
+                                <span class="nf-icon">{move || volume_icon(audio.get().as_ref())}</span>
+                                {move || match audio.get() {
+                                    Some(s) if s.has_device => format!(" {}%", s.volume),
+                                    _ => " --".to_string(),
                                 }}
                             </div>
 
@@ -378,7 +534,7 @@ fn App() -> impl IntoView {
                                 on:click=take_screenshot
                                 title="截图 (Flameshot)"
                             >
-                                {move || if is_taking.get() { "⏳" } else { "📸" }}
+                                <span class="nf-icon">{ICON_SHOT}</span>
                             </div>
 
                             <div
@@ -386,11 +542,13 @@ fn App() -> impl IntoView {
                                 on:click=move |_| set_show_seconds.update(|v| *v = !*v)
                                 title="点击切换秒显示"
                             >
-                                {move || formatted_time.get()}
+                                <span class="nf-icon">{ICON_TIME}</span>
+                                {move || format!(" {}", formatted_time.get())}
                             </div>
 
                             <div class="pill monitor-pill" title="显示器">
-                                {format!("🖥️ {}", monitor_icon(monitor_num))}
+                                <span class="nf-icon">{ICON_MON}</span>
+                                {format!(" {}", monitor_icon(monitor_num))}
                             </div>
 
                             <div class="pill scale-pill" title="Scale Factor">
