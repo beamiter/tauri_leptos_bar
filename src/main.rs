@@ -509,11 +509,6 @@ fn App() -> impl IntoView {
                                     let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta }).unwrap_or(JsValue::NULL);
                                     invoke_async("adjust_volume", args);
                                 }
-                                on:contextmenu=move |e: MouseEvent| {
-                                    e.prevent_default();
-                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta: -5 }).unwrap_or(JsValue::NULL);
-                                    invoke_async("adjust_volume", args);
-                                }
                                 title="左键静音 / 滚轮调节"
                             >
                                 <span class="nf-icon">{move || volume_icon(audio.get().as_ref())}</span>
