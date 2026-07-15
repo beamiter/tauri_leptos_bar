@@ -3,8 +3,8 @@ use gloo_console::error;
 use gloo_timers::callback::Interval;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
+use wasm_bindgen::prelude::*;
 use web_sys::{MouseEvent, WheelEvent};
 
 #[wasm_bindgen]
@@ -13,7 +13,10 @@ extern "C" {
     async fn tauri_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = listen, catch)]
-    async fn tauri_listen(event: &str, handler: &Closure<dyn FnMut(JsValue)>) -> Result<JsValue, JsValue>;
+    async fn tauri_listen(
+        event: &str,
+        handler: &Closure<dyn FnMut(JsValue)>,
+    ) -> Result<JsValue, JsValue>;
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
@@ -122,11 +125,7 @@ fn parse_lt_symbol(lts: &str) -> (String, Option<f32>) {
     if lts.is_empty() {
         return ("[]=".to_string(), None);
     }
-    let symbol = lts
-        .split_whitespace()
-        .next()
-        .unwrap_or("[]=")
-        .to_string();
+    let symbol = lts.split_whitespace().next().unwrap_or("[]=").to_string();
     let scale = lts.find("s:").and_then(|i| {
         let rest = &lts[i + 2..];
         let s: String = rest
@@ -221,63 +220,48 @@ fn App() -> impl IntoView {
     let (now, set_now) = signal(Local::now());
     let (is_taking, set_is_taking) = signal(false);
 
-    // listen monitor-update
+    // Register every state listener before asking the backend for a full replay.
     Effect::new(move |_| {
-        let cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
-            if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<MonitorInfoSnapshot>>(evt) {
-                set_monitor.set(Some(p.payload));
+        let monitor_cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
+            if let Ok(p) =
+                serde_wasm_bindgen::from_value::<EventPayload<Option<MonitorInfoSnapshot>>>(evt)
+            {
+                set_monitor.set(p.payload);
             }
         });
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = tauri_listen("monitor-update", &cb).await {
-                error!(format!("listen failed: {:?}", e));
-            }
-            cb.forget();
-        });
-    });
-
-    // listen system-update
-    Effect::new(move |_| {
-        let cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
+        let system_cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
             if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<SystemSnapshot>>(evt) {
                 set_system.set(Some(p.payload));
             }
         });
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = tauri_listen("system-update", &cb).await {
-                error!(format!("listen failed: {:?}", e));
-            }
-            cb.forget();
-        });
-    });
-
-    // listen audio-update
-    Effect::new(move |_| {
-        let cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
+        let audio_cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
             if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<AudioSnapshot>>(evt) {
                 set_audio.set(Some(p.payload));
             }
         });
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = tauri_listen("audio-update", &cb).await {
-                error!(format!("listen failed: {:?}", e));
-            }
-            cb.forget();
-        });
-    });
-
-    // listen brightness-update
-    Effect::new(move |_| {
-        let cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
+        let brightness_cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
             if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<BrightnessSnapshot>>(evt) {
                 set_brightness.set(Some(p.payload));
             }
         });
+
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = tauri_listen("brightness-update", &cb).await {
-                error!(format!("listen failed: {:?}", e));
+            let registration = async {
+                tauri_listen("monitor-update", &monitor_cb).await?;
+                tauri_listen("system-update", &system_cb).await?;
+                tauri_listen("audio-update", &audio_cb).await?;
+                tauri_listen("brightness-update", &brightness_cb).await?;
+                tauri_invoke("frontend_ready", JsValue::NULL).await?;
+                Ok::<(), JsValue>(())
             }
-            cb.forget();
+            .await;
+            if let Err(e) = registration {
+                error!(format!("failed to initialize Tauri event bridge: {:?}", e));
+            }
+            monitor_cb.forget();
+            system_cb.forget();
+            audio_cb.forget();
+            brightness_cb.forget();
         });
     });
 
