@@ -1,6 +1,6 @@
-use chrono::{Datelike, Local, Timelike};
+use std::{cell::Cell, rc::Rc};
+
 use gloo_console::error;
-use gloo_timers::callback::Interval;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
@@ -17,54 +17,93 @@ extern "C" {
         event: &str,
         handler: &Closure<dyn FnMut(JsValue)>,
     ) -> Result<JsValue, JsValue>;
+
+    type TauriWindow;
+
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "window"], js_name = getCurrentWindow)]
+    fn get_current_window() -> TauriWindow;
+
+    #[wasm_bindgen(method, js_name = scaleFactor, catch)]
+    async fn scale_factor(this: &TauriWindow) -> Result<JsValue, JsValue>;
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
-struct TagStatus {
-    is_selected: bool,
-    is_urg: bool,
-    is_filled: bool,
-    is_occ: bool,
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+struct TagState {
+    selected: bool,
+    urgent: bool,
+    filled: bool,
+    occupied: bool,
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-struct MonitorInfoSnapshot {
-    monitor_num: i32,
-    monitor_width: i32,
-    monitor_height: i32,
-    monitor_x: i32,
-    monitor_y: i32,
-    tag_status_vec: Vec<TagStatus>,
-    client_name: String,
-    ltsymbol: String,
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct AudioDeviceInfo {
+    name: String,
+    volume: i32,
+    is_muted: bool,
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-struct SystemSnapshot {
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+struct SystemDetails {
     cpu_average: f32,
     memory_used: u64,
     memory_total: u64,
     memory_usage_percent: f32,
-    battery_percent: f32,
-    is_charging: bool,
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-struct AudioSnapshot {
-    volume: i32,
-    is_muted: bool,
-    device_name: String,
-    has_device: bool,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+struct BrightnessState {
+    percent: Option<f32>,
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-struct BrightnessSnapshot {
-    percent: Option<u8>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+struct BatteryState {
+    percent: Option<f32>,
+    charging: bool,
+    present: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct BarSnapshot {
+    tags: Vec<TagState>,
+    monitor: i32,
+    layout_symbol: String,
+    client_name: String,
+    time: String,
+    show_seconds: bool,
+    layout_selector_open: bool,
+    audio_device: Option<AudioDeviceInfo>,
+    system_details: SystemDetails,
+    brightness: BrightnessState,
+    battery: BatteryState,
+}
+
+#[derive(Deserialize)]
+struct FrontendEnvelope {
+    revision: u64,
+    snapshot: BarSnapshot,
 }
 
 #[derive(Deserialize)]
 struct EventPayload<T> {
     payload: T,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ActionRequest {
+    ViewTagOn { tag_index: usize, monitor_id: i32 },
+    ToggleLayoutSelector,
+    SetLayoutOn { layout_id: u32, monitor_id: i32 },
+    ToggleSeconds,
+    ToggleMute,
+    AdjustVolume { delta: i32 },
+    AdjustBrightness { delta: i32 },
+    Screenshot,
+}
+
+#[derive(Serialize)]
+struct DispatchArgs {
+    request: ActionRequest,
 }
 
 const TAG_ICONS: [&str; 9] = [
@@ -92,14 +131,14 @@ const ICON_SHOT: &str = "\u{F0104}";
 const ICON_TIME: &str = "\u{F0954}";
 const ICON_MON: &str = "\u{F0379}";
 
-fn button_class(t: &TagStatus) -> &'static str {
-    if t.is_filled {
+fn button_class(tag: &TagState) -> &'static str {
+    if tag.filled {
         "emoji-button state-filtered"
-    } else if t.is_selected {
+    } else if tag.selected {
         "emoji-button state-selected"
-    } else if t.is_urg {
+    } else if tag.urgent {
         "emoji-button state-urgent"
-    } else if t.is_occ {
+    } else if tag.occupied {
         "emoji-button state-occupied"
     } else {
         "emoji-button state-default"
@@ -108,185 +147,108 @@ fn button_class(t: &TagStatus) -> &'static str {
 
 fn format_bytes(bytes: u64) -> String {
     if bytes == 0 {
-        return "0B".to_string();
+        return "0B".to_owned();
     }
-    const U: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let i = ((bytes as f64).ln() / 1024f64.ln()).floor() as usize;
-    let i = i.min(U.len() - 1);
-    let s = bytes as f64 / 1024f64.powi(i as i32);
-    if i == 0 {
-        format!("{:.0}{}", s, U[i])
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let index = ((bytes as f64).ln() / 1024_f64.ln()).floor() as usize;
+    let index = index.min(UNITS.len() - 1);
+    let size = bytes as f64 / 1024_f64.powi(index as i32);
+    if index == 0 {
+        format!("{size:.0}{}", UNITS[index])
     } else {
-        format!("{:.1}{}", s, U[i])
+        format!("{size:.1}{}", UNITS[index])
     }
 }
 
-fn parse_lt_symbol(lts: &str) -> (String, Option<f32>) {
-    if lts.is_empty() {
-        return ("[]=".to_string(), None);
-    }
-    let symbol = lts.split_whitespace().next().unwrap_or("[]=").to_string();
-    let scale = lts.find("s:").and_then(|i| {
-        let rest = &lts[i + 2..];
-        let s: String = rest
-            .chars()
-            .skip_while(|c| c.is_whitespace())
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        s.parse::<f32>().ok()
-    });
-    (symbol, scale)
-}
-
-fn monitor_icon(n: i32) -> String {
-    if n == 0 {
-        "\u{F02DA}".to_string()
-    } else if n == 1 {
-        "\u{F02DB}".to_string()
-    } else {
-        format!("M{}", n)
+fn monitor_icon(monitor: i32) -> String {
+    match monitor {
+        0 => "\u{F02DA}".to_owned(),
+        1 => "\u{F02DB}".to_owned(),
+        _ => format!("M{monitor}"),
     }
 }
 
-fn sev(p: f32) -> &'static str {
-    if p <= 30.0 {
+fn severity(percent: f32) -> &'static str {
+    if percent <= 30.0 {
         "usage-good"
-    } else if p <= 60.0 {
+    } else if percent <= 60.0 {
         "usage-warn"
-    } else if p <= 80.0 {
+    } else if percent <= 80.0 {
         "usage-caution"
     } else {
         "usage-danger"
     }
 }
 
-fn volume_icon(a: Option<&AudioSnapshot>) -> &'static str {
-    match a {
+fn volume_icon(device: Option<&AudioDeviceInfo>) -> &'static str {
+    match device {
         None => ICON_VOL_MUTE,
-        Some(s) => {
-            if !s.has_device || s.is_muted || s.volume <= 0 {
-                ICON_VOL_MUTE
-            } else if s.volume < 34 {
-                ICON_VOL_LOW
-            } else if s.volume < 67 {
-                ICON_VOL_MID
-            } else {
-                ICON_VOL_HIGH
-            }
-        }
+        Some(device) if device.is_muted || device.volume <= 0 => ICON_VOL_MUTE,
+        Some(device) if device.volume < 34 => ICON_VOL_LOW,
+        Some(device) if device.volume < 67 => ICON_VOL_MID,
+        Some(_) => ICON_VOL_HIGH,
     }
 }
 
-fn invoke_async(cmd: &'static str, args: JsValue) {
+fn dispatch_args(request: ActionRequest) -> JsValue {
+    serde_wasm_bindgen::to_value(&DispatchArgs { request }).unwrap_or(JsValue::NULL)
+}
+
+fn dispatch_action(request: ActionRequest) {
+    let args = dispatch_args(request);
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(e) = tauri_invoke(cmd, args).await {
-            error!(format!("invoke {} failed: {:?}", cmd, e));
+        if let Err(error) = tauri_invoke("dispatch_action", args).await {
+            error!(format!("dispatch_action failed: {error:?}"));
         }
     });
 }
 
-#[derive(Serialize)]
-struct TagCmdArgs {
-    #[serde(rename = "tagIndex")]
-    tag_index: usize,
-    #[serde(rename = "isView")]
-    is_view: bool,
-    #[serde(rename = "monitorId")]
-    monitor_id: i32,
-}
-
-#[derive(Serialize)]
-struct LayoutCmdArgs {
-    #[serde(rename = "layoutIndex")]
-    layout_index: u32,
-    #[serde(rename = "monitorId")]
-    monitor_id: i32,
-}
-
-#[derive(Serialize)]
-struct DeltaArgs {
-    delta: i32,
-}
-
 #[component]
 fn App() -> impl IntoView {
-    let (monitor, set_monitor) = signal(None::<MonitorInfoSnapshot>);
-    let (system, set_system) = signal(None::<SystemSnapshot>);
-    let (audio, set_audio) = signal(None::<AudioSnapshot>);
-    let (brightness, set_brightness) = signal(None::<BrightnessSnapshot>);
+    let (snapshot, set_snapshot) = signal(None::<BarSnapshot>);
+    let (scale_factor, set_scale_factor) = signal(None::<f64>);
     let (pressed, set_pressed) = signal(None::<usize>);
-    let (layout_open, set_layout_open) = signal(false);
-    let (show_seconds, set_show_seconds) = signal(true);
-    let (now, set_now) = signal(Local::now());
     let (is_taking, set_is_taking) = signal(false);
 
-    // Register every state listener before asking the backend for a full replay.
     Effect::new(move |_| {
-        let monitor_cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
-            if let Ok(p) =
-                serde_wasm_bindgen::from_value::<EventPayload<Option<MonitorInfoSnapshot>>>(evt)
-            {
-                set_monitor.set(p.payload);
-            }
-        });
-        let system_cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
-            if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<SystemSnapshot>>(evt) {
-                set_system.set(Some(p.payload));
-            }
-        });
-        let audio_cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
-            if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<AudioSnapshot>>(evt) {
-                set_audio.set(Some(p.payload));
-            }
-        });
-        let brightness_cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
-            if let Ok(p) = serde_wasm_bindgen::from_value::<EventPayload<BrightnessSnapshot>>(evt) {
-                set_brightness.set(Some(p.payload));
+        let latest_revision = Rc::new(Cell::new(None::<u64>));
+        let callback_revision = Rc::clone(&latest_revision);
+        let state_callback = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+            match serde_wasm_bindgen::from_value::<EventPayload<FrontendEnvelope>>(event) {
+                Ok(event) => {
+                    let envelope = event.payload;
+                    if callback_revision
+                        .get()
+                        .is_some_and(|revision| envelope.revision < revision)
+                    {
+                        return;
+                    }
+                    callback_revision.set(Some(envelope.revision));
+                    set_snapshot.set(Some(envelope.snapshot));
+                }
+                Err(error) => error!(format!("failed to decode xbar-state: {error}")),
             }
         });
 
         wasm_bindgen_futures::spawn_local(async move {
             let registration = async {
-                tauri_listen("monitor-update", &monitor_cb).await?;
-                tauri_listen("system-update", &system_cb).await?;
-                tauri_listen("audio-update", &audio_cb).await?;
-                tauri_listen("brightness-update", &brightness_cb).await?;
+                tauri_listen("xbar-state", &state_callback).await?;
+
+                let window = get_current_window();
+                match window.scale_factor().await {
+                    Ok(value) => set_scale_factor.set(value.as_f64()),
+                    Err(error) => error!(format!("failed to query scale factor: {error:?}")),
+                }
+
                 tauri_invoke("frontend_ready", JsValue::NULL).await?;
                 Ok::<(), JsValue>(())
             }
             .await;
-            if let Err(e) = registration {
-                error!(format!("failed to initialize Tauri event bridge: {:?}", e));
+            if let Err(error) = registration {
+                error!(format!("failed to initialize xbar Tauri bridge: {error:?}"));
             }
-            monitor_cb.forget();
-            system_cb.forget();
-            audio_cb.forget();
-            brightness_cb.forget();
+            state_callback.forget();
         });
-    });
-
-    // tick clock — re-arm interval whenever show_seconds changes
-    Effect::new(move |prev: Option<Interval>| {
-        drop(prev);
-        let secs = show_seconds.get();
-        let interval_ms = if secs { 1000 } else { 60000 };
-        Interval::new(interval_ms, move || set_now.set(Local::now()))
-    });
-
-    let formatted_time = Memo::new(move |_| {
-        let d = now.get();
-        let pad = |n: u32| format!("{:02}", n);
-        let ts = if show_seconds.get() {
-            format!("{}:{}:{}", pad(d.hour()), pad(d.minute()), pad(d.second()))
-        } else {
-            format!("{}:{}", pad(d.hour()), pad(d.minute()))
-        };
-        format!("{}-{}-{} {}", d.year(), pad(d.month()), pad(d.day()), ts)
-    });
-
-    let lt = Memo::new(move |_| match monitor.get() {
-        Some(m) => parse_lt_symbol(&m.ltsymbol),
-        None => ("[]=".to_string(), None),
     });
 
     let take_screenshot = move |_| {
@@ -294,9 +256,10 @@ fn App() -> impl IntoView {
             return;
         }
         set_is_taking.set(true);
+        let args = dispatch_args(ActionRequest::Screenshot);
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = tauri_invoke("take_screenshot", JsValue::NULL).await {
-                error!(format!("screenshot failed: {:?}", e));
+            if let Err(error) = tauri_invoke("dispatch_action", args).await {
+                error!(format!("screenshot failed: {error:?}"));
             }
             gloo_timers::future::TimeoutFuture::new(500).await;
             set_is_taking.set(false);
@@ -305,43 +268,105 @@ fn App() -> impl IntoView {
 
     view! {
         <Show
-            when=move || monitor.get().is_some()
+            when=move || snapshot.get().is_some()
             fallback=|| view! { <div class="button-row">"Loading..."</div> }
         >
             {move || {
-                let m = monitor.get().unwrap();
-                let monitor_num = m.monitor_num;
-                let tags = m.tag_status_vec.clone();
+                let current = snapshot.get().expect("snapshot is present inside Show");
+                let monitor = current.monitor;
+                let tags = current.tags;
+                let layout_symbol = current.layout_symbol;
+                let layout_open = current.layout_selector_open;
+                let system = current.system_details;
+                let battery = current.battery;
+                let audio = current.audio_device;
+                let brightness = current.brightness.percent;
+                let time = current.time;
+                let show_seconds = current.show_seconds;
+                let monitor_title = if current.client_name.is_empty() {
+                    "显示器".to_owned()
+                } else {
+                    current.client_name
+                };
+
+                let cpu_class = format!("pill usage-pill {}", severity(system.cpu_average));
+                let memory_class =
+                    format!("pill usage-pill {}", severity(system.memory_usage_percent));
+                let memory_title = format!(
+                    "内存使用: {} / {}",
+                    format_bytes(system.memory_used),
+                    format_bytes(system.memory_total),
+                );
+
+                let battery_percent = if battery.present { battery.percent } else { None };
+                let battery_class = format!(
+                    "pill usage-pill {}",
+                    match battery_percent {
+                        None => "usage-warn",
+                        Some(percent) if percent > 50.0 => "usage-good",
+                        Some(percent) if percent > 20.0 => "usage-warn",
+                        Some(_) => "usage-danger",
+                    },
+                );
+                let battery_icon = if battery.charging { ICON_BAT_CHG } else { ICON_BAT_FULL };
+                let battery_title = match battery_percent {
+                    None => "未检测到电池".to_owned(),
+                    Some(percent) if battery.charging => format!("电池充电中: {percent:.1}%"),
+                    Some(percent) => format!("电池电量: {percent:.1}%"),
+                };
+                let battery_label = battery_percent
+                    .map_or_else(|| " --".to_owned(), |percent| format!(" {percent:.0}%"));
+
+                let audio_muted = audio.as_ref().is_none_or(|device| device.is_muted);
+                let audio_class = if audio_muted {
+                    "pill volume-pill muted"
+                } else {
+                    "pill volume-pill"
+                };
+                let audio_icon = volume_icon(audio.as_ref());
+                let audio_label = audio
+                    .as_ref()
+                    .map_or_else(|| " --".to_owned(), |device| format!(" {}%", device.volume));
+                let audio_title = audio.as_ref().map_or_else(
+                    || "左键静音 / 滚轮调节".to_owned(),
+                    |device| device.name.clone(),
+                );
+                let brightness_label = brightness
+                    .map_or_else(|| " --".to_owned(), |percent| format!(" {percent:.0}%"));
+                let time_title = if show_seconds { "点击隐藏秒" } else { "点击显示秒" };
+                let layout_toggle_class = if layout_open {
+                    "pill layout-toggle open"
+                } else {
+                    "pill layout-toggle closed"
+                };
 
                 view! {
                     <div class="button-row">
                         <div class="buttons-container">
                             {
-                                TAG_ICONS.iter().enumerate().map(|(i, icon)| {
-                                    let tag = tags.get(i).cloned().unwrap_or_default();
-                                    let base = button_class(&tag);
-                                    let cls = move || {
-                                        if pressed.get() == Some(i) {
-                                            format!("{} pressed", base)
+                                TAG_ICONS.iter().enumerate().map(|(index, icon)| {
+                                    let tag = tags.get(index).cloned().unwrap_or_default();
+                                    let base_class = button_class(&tag);
+                                    let class = move || {
+                                        if pressed.get() == Some(index) {
+                                            format!("{base_class} pressed")
                                         } else {
-                                            base.to_string()
+                                            base_class.to_owned()
                                         }
                                     };
                                     view! {
                                         <button
-                                            class=cls
-                                            on:mousedown=move |_| set_pressed.set(Some(i))
+                                            class=class
+                                            on:mousedown=move |_| set_pressed.set(Some(index))
                                             on:mouseup=move |_| {
                                                 set_pressed.set(None);
-                                                let args = serde_wasm_bindgen::to_value(&TagCmdArgs {
-                                                    tag_index: i,
-                                                    is_view: true,
-                                                    monitor_id: monitor_num,
-                                                }).unwrap_or(JsValue::NULL);
-                                                invoke_async("send_tag_command", args);
+                                                dispatch_action(ActionRequest::ViewTagOn {
+                                                    tag_index: index,
+                                                    monitor_id: monitor,
+                                                });
                                             }
                                             on:mouseleave=move |_| set_pressed.set(None)
-                                            title=format!("Tag {}", i + 1)
+                                            title=format!("Tag {}", index + 1)
                                         >
                                             <span class="nf-icon">{*icon}</span>
                                         </button>
@@ -351,45 +376,36 @@ fn App() -> impl IntoView {
 
                             <div class="layout-controls">
                                 <div
-                                    class=move || {
-                                        if layout_open.get() {
-                                            "pill layout-toggle open"
-                                        } else {
-                                            "pill layout-toggle closed"
-                                        }
+                                    class=layout_toggle_class
+                                    on:click=move |_| {
+                                        dispatch_action(ActionRequest::ToggleLayoutSelector)
                                     }
-                                    on:click=move |_| set_layout_open.update(|v| *v = !*v)
                                     title="切换布局"
                                 >
-                                    {move || lt.get().0}
+                                    {layout_symbol.clone()}
                                 </div>
-                                <Show when=move || layout_open.get() fallback=|| ()>
+                                <Show when=move || layout_open fallback=|| ()>
                                     <div class="layout-selector">
                                         {
-                                            [("[]=", 0u32), ("><>", 1u32), ("[M]", 2u32)]
+                                            [("[]=", 0_u32), ("><>", 1_u32), ("[M]", 2_u32)]
                                                 .into_iter()
-                                                .map(|(label, idx)| {
-                                                    let label_owned = label.to_string();
-                                                    let cls = move || {
-                                                        if lt.get().0 == label_owned {
-                                                            "pill layout-option current"
-                                                        } else {
-                                                            "pill layout-option"
-                                                        }
+                                                .map(|(label, layout_id)| {
+                                                    let class = if layout_symbol == label {
+                                                        "pill layout-option current"
+                                                    } else {
+                                                        "pill layout-option"
                                                     };
                                                     view! {
                                                         <div
-                                                            class=cls
+                                                            class=class
                                                             on:click=move |_| {
-                                                                set_layout_open.set(false);
-                                                                let args = serde_wasm_bindgen::to_value(&LayoutCmdArgs {
-                                                                    layout_index: idx,
-                                                                    monitor_id: monitor_num,
-                                                                }).unwrap_or(JsValue::NULL);
-                                                                invoke_async("send_layout_command", args);
+                                                                dispatch_action(ActionRequest::SetLayoutOn {
+                                                                    layout_id,
+                                                                    monitor_id: monitor,
+                                                                });
                                                             }
                                                         >
-                                                            {label.to_string()}
+                                                            {label}
                                                         </div>
                                                     }
                                                 })
@@ -404,102 +420,52 @@ fn App() -> impl IntoView {
 
                         <div class="right-info-container">
                             <div class="system-info-container">
-                                {move || match system.get() {
-                                    Some(s) => {
-                                        let cpu_cls = format!("pill usage-pill {}", sev(s.cpu_average));
-                                        let mem_cls = format!("pill usage-pill {}", sev(s.memory_usage_percent));
-                                        let batt_cls = format!("pill usage-pill {}",
-                                            if s.battery_percent > 50.0 { "usage-good" }
-                                            else if s.battery_percent > 20.0 { "usage-warn" }
-                                            else { "usage-danger" });
-                                        let batt_icon = if s.is_charging { ICON_BAT_CHG } else { ICON_BAT_FULL };
-                                        let mem_title = format!("内存使用: {} / {}", format_bytes(s.memory_used), format_bytes(s.memory_total));
-                                        let batt_title = if s.is_charging {
-                                            format!("电池充电中: {:.1}%", s.battery_percent)
-                                        } else {
-                                            format!("电池电量: {:.1}%", s.battery_percent)
-                                        };
-                                        view! {
-                                            <>
-                                                <div class=cpu_cls title="CPU 平均使用率">
-                                                    <span class="nf-icon">{ICON_CPU}</span>
-                                                    {format!(" {:.0}%", s.cpu_average)}
-                                                </div>
-                                                <div class=mem_cls title=mem_title>
-                                                    <span class="nf-icon">{ICON_MEM}</span>
-                                                    {format!(" {:.0}%", s.memory_usage_percent)}
-                                                </div>
-                                                <div class=batt_cls title=batt_title>
-                                                    <span class="nf-icon">{batt_icon}</span>
-                                                    {format!(" {:.0}%", s.battery_percent)}
-                                                </div>
-                                            </>
-                                        }.into_any()
-                                    }
-                                    None => view! {
-                                        <>
-                                            <div class="pill usage-pill usage-warn">
-                                                <span class="nf-icon">{ICON_CPU}</span>" --%"
-                                            </div>
-                                            <div class="pill usage-pill usage-warn">
-                                                <span class="nf-icon">{ICON_MEM}</span>" --%"
-                                            </div>
-                                            <div class="pill usage-pill usage-warn">
-                                                <span class="nf-icon">{ICON_BAT_FULL}</span>" --%"
-                                            </div>
-                                        </>
-                                    }.into_any()
-                                }}
+                                <div class=cpu_class title="CPU 平均使用率">
+                                    <span class="nf-icon">{ICON_CPU}</span>
+                                    {format!(" {:.0}%", system.cpu_average)}
+                                </div>
+                                <div class=memory_class title=memory_title>
+                                    <span class="nf-icon">{ICON_MEM}</span>
+                                    {format!(" {:.0}%", system.memory_usage_percent)}
+                                </div>
+                                <div class=battery_class title=battery_title>
+                                    <span class="nf-icon">{battery_icon}</span>
+                                    {battery_label}
+                                </div>
                             </div>
 
                             <div
                                 class="pill brightness-pill"
                                 on:click=move |_| {
-                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta: 5 }).unwrap_or(JsValue::NULL);
-                                    invoke_async("adjust_brightness", args);
+                                    dispatch_action(ActionRequest::AdjustBrightness { delta: 5 })
                                 }
-                                on:wheel=move |e: WheelEvent| {
-                                    e.prevent_default();
-                                    let delta = if e.delta_y() < 0.0 { 5 } else { -5 };
-                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta }).unwrap_or(JsValue::NULL);
-                                    invoke_async("adjust_brightness", args);
+                                on:wheel=move |event: WheelEvent| {
+                                    event.prevent_default();
+                                    let delta = if event.delta_y() < 0.0 { 5 } else { -5 };
+                                    dispatch_action(ActionRequest::AdjustBrightness { delta });
                                 }
-                                on:contextmenu=move |e: MouseEvent| {
-                                    e.prevent_default();
-                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta: -5 }).unwrap_or(JsValue::NULL);
-                                    invoke_async("adjust_brightness", args);
+                                on:contextmenu=move |event: MouseEvent| {
+                                    event.prevent_default();
+                                    dispatch_action(ActionRequest::AdjustBrightness { delta: -5 });
                                 }
                                 title="左键加亮 / 右键减暗 / 滚轮调节"
                             >
                                 <span class="nf-icon">{ICON_BRIGHT}</span>
-                                {move || match brightness.get().and_then(|b| b.percent) {
-                                    Some(p) => format!(" {}%", p),
-                                    None => " --".to_string(),
-                                }}
+                                {brightness_label}
                             </div>
 
                             <div
-                                class=move || {
-                                    let muted = match audio.get() {
-                                        None => true,
-                                        Some(s) => s.is_muted || !s.has_device,
-                                    };
-                                    if muted { "pill volume-pill muted" } else { "pill volume-pill" }
+                                class=audio_class
+                                on:click=move |_| dispatch_action(ActionRequest::ToggleMute)
+                                on:wheel=move |event: WheelEvent| {
+                                    event.prevent_default();
+                                    let delta = if event.delta_y() < 0.0 { 5 } else { -5 };
+                                    dispatch_action(ActionRequest::AdjustVolume { delta });
                                 }
-                                on:click=move |_| invoke_async("toggle_mute", JsValue::NULL)
-                                on:wheel=move |e: WheelEvent| {
-                                    e.prevent_default();
-                                    let delta = if e.delta_y() < 0.0 { 5 } else { -5 };
-                                    let args = serde_wasm_bindgen::to_value(&DeltaArgs { delta }).unwrap_or(JsValue::NULL);
-                                    invoke_async("adjust_volume", args);
-                                }
-                                title="左键静音 / 滚轮调节"
+                                title=audio_title
                             >
-                                <span class="nf-icon">{move || volume_icon(audio.get().as_ref())}</span>
-                                {move || match audio.get() {
-                                    Some(s) if s.has_device => format!(" {}%", s.volume),
-                                    _ => " --".to_string(),
-                                }}
+                                <span class="nf-icon">{audio_icon}</span>
+                                {audio_label}
                             </div>
 
                             <div
@@ -518,23 +484,23 @@ fn App() -> impl IntoView {
 
                             <div
                                 class="pill time-pill"
-                                on:click=move |_| set_show_seconds.update(|v| *v = !*v)
-                                title="点击切换秒显示"
+                                on:click=move |_| dispatch_action(ActionRequest::ToggleSeconds)
+                                title=time_title
                             >
                                 <span class="nf-icon">{ICON_TIME}</span>
-                                {move || format!(" {}", formatted_time.get())}
+                                {format!(" {time}")}
                             </div>
 
-                            <div class="pill monitor-pill" title="显示器">
+                            <div class="pill monitor-pill" title=monitor_title>
                                 <span class="nf-icon">{ICON_MON}</span>
-                                {format!(" {}", monitor_icon(monitor_num))}
+                                {format!(" {}", monitor_icon(monitor))}
                             </div>
 
                             <div class="pill scale-pill" title="Scale Factor">
-                                {move || match lt.get().1 {
-                                    Some(s) => format!("s: {:.2}", s),
-                                    None => "s: --".to_string(),
-                                }}
+                                {move || scale_factor.get().map_or_else(
+                                    || "s: --".to_owned(),
+                                    |scale| format!("s: {scale:.2}"),
+                                )}
                             </div>
                         </div>
                     </div>
@@ -548,11 +514,11 @@ fn main() {
     console_error_panic_hook::set_once();
     leptos::mount::mount_to(
         web_sys::window()
-            .unwrap()
+            .expect("browser window is available")
             .document()
-            .unwrap()
+            .expect("browser document is available")
             .get_element_by_id("root")
-            .unwrap()
+            .expect("root element is available")
             .unchecked_into(),
         App,
     )
